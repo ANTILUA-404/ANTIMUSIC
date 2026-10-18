@@ -421,47 +421,36 @@ export class MusicService {
 
       let fallbackNote: string | null = null;
 
-      // Jika link langsung YouTube diblokir oleh IP server, ambil judul via oEmbed dan cari di SoundCloud
+      // Jika link langsung YouTube diblokir oleh IP server, ambil judul via oEmbed dan cari di YouTube/Spotify/SoundCloud
       if (isDirectUrl && isYoutubeBlocked && /(youtube\.com|youtu\.be)/i.test(searchQuery)) {
-        log.warn({ url: searchQuery }, "Link YouTube diblokir IP. Mencari judul via oEmbed untuk fallback SoundCloud...");
+        log.warn({ url: searchQuery }, "Link YouTube diblokir IP. Mencari judul via oEmbed untuk pencarian ulang...");
         const ytTitle = await getYoutubeTitleFromUrl(searchQuery);
         if (ytTitle) {
-          try {
-            let scResult: any = await player.search(
-              { query: ytTitle, source: "scsearch" },
-              ctx.user
-            ).catch(() => null);
-
-            if (!scResult?.tracks?.length || scResult?.loadType === "error") {
-              const simpler = ytTitle.replace(/-.*/, "").trim();
-              if (simpler && simpler.length > 2) {
-                scResult = await player.search(
-                  { query: simpler, source: "scsearch" },
-                  ctx.user
-                ).catch(() => null);
+          for (const src of ["ytsearch", "spsearch", "scsearch"]) {
+            try {
+              const res: any = await player.search({ query: ytTitle, source: src }, ctx.user).catch(() => null);
+              if (res && res.loadType !== "error" && res.tracks?.length) {
+                result = res;
+                fallbackNote = `Diputar dari hasil pencarian: "${ytTitle}" (${src})`;
+                break;
               }
-            }
-
-            if (scResult && scResult.loadType !== "error" && scResult.tracks?.length) {
-              result = scResult;
-              fallbackNote = `Diputar via SoundCloud (pencarian: "${ytTitle}")`;
-            }
-          } catch {}
+            } catch {}
+          }
         }
       }
 
-      // Jika pencarian YouTube diblokir IP/login atau tidak ditemukan, otomatis fallback ke SoundCloud (scsearch)
+      // Jika pencarian kata kunci diblokir atau kosong, coba sumber lain (spsearch, scsearch)
       if ((!result || result.loadType === "empty" || isYoutubeBlocked) && !isDirectUrl) {
-        log.warn({ query: searchQuery }, "YouTube terblokir / requires login. Mencoba fallback ke SoundCloud (scsearch)...");
-        try {
-          const scResult: any = await player.search(
-            { query: searchQuery, source: "scsearch" },
-            ctx.user
-          );
-          if (scResult && scResult.loadType !== "error" && scResult.tracks?.length) {
-            result = scResult;
-          }
-        } catch {}
+        log.warn({ query: searchQuery }, "YouTube terblokir / requires login. Mencoba fallback ke Spotify / SoundCloud...");
+        for (const src of ["spsearch", "scsearch", "ytsearch"]) {
+          try {
+            const altRes: any = await player.search({ query: searchQuery, source: src }, ctx.user).catch(() => null);
+            if (altRes && altRes.loadType !== "error" && altRes.tracks?.length) {
+              result = altRes;
+              break;
+            }
+          } catch {}
+        }
       }
 
       if (result?.loadType === "error") {
