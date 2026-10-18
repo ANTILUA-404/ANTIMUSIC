@@ -33,6 +33,9 @@ export const slashCommands = [
       { name: "🎤 Vocal & Acoustic Clarity", value: "vocal" },
       { name: "⚪ Standard Flat (Off)", value: "off" }
     )),
+  new SlashCommandBuilder().setName("nodes").setDescription("Tampilkan status cluster node Lavalink & auto-failover"),
+  new SlashCommandBuilder().setName("changenode").setDescription("Pindahkan pemutaran musik ke host/node Lavalink lain")
+    .addStringOption(o => o.setName("target").setDescription("Nomor atau nama host/node").setRequired(true)),
   new SlashCommandBuilder().setName("help").setDescription("Show ANTIMUSIC commands"),
   new SlashCommandBuilder().setName("ping").setDescription("Show bot latency")
 ].map(x => x.toJSON());

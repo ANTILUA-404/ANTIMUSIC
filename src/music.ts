@@ -53,23 +53,13 @@ export class MusicService {
 
   constructor(private client: Client) {
     this.lavalink = new LavalinkManager({
-      nodes: [
-        {
-          id: "ANTIMUSIC-MAIN",
-          host: config.lavalink.host,
-          port: config.lavalink.port,
-          authorization: config.lavalink.authorization,
-          secure: config.lavalink.secure,
-          retryAmount: 30,
-          retryDelay: 3000,
-          requestSignalTimeoutMS: 15000,
-        },
-      ],
+      nodes: config.lavalinkNodes,
       sendToShard: (guildId: string, payload: any) => {
         const guild = this.client.guilds.cache.get(guildId);
         (guild?.shard ?? this.client.ws.shards.first())?.send(payload);
       },
       autoSkip: true,
+      autoMove: config.autoFailover,
       client: { id: config.clientId, username: "ANTIMUSIC" },
       playerOptions: {
         defaultSearchPlatform: "ytmsearch",
@@ -165,8 +155,47 @@ export class MusicService {
       log.error({ node: node.id, error: error?.message || error }, "Lavalink node error");
     });
 
-    this.lavalink.nodeManager.on("disconnect", (node: any, reason: any) => {
-      log.warn({ node: node.id, reason }, "Lavalink disconnected");
+    this.lavalink.nodeManager.on("disconnect", async (node: any, reason: any) => {
+      log.warn({ node: node.id, reason }, "Lavalink node disconnected. Checking failover candidates...");
+
+      if (!config.autoFailover) return;
+
+      const affectedPlayers = this.getAllPlayers().filter(
+        (p: any) => p.node?.options?.id === node.options?.id || p.node?.id === node.id
+      );
+
+      if (!affectedPlayers.length) return;
+
+      const healthyNodes = Array.from(this.lavalink.nodeManager.nodes.values()).filter(
+        (n: any) => n.id !== node.id && n.connected && n.sessionId
+      );
+
+      if (!healthyNodes.length) {
+        log.warn({ node: node.id }, "No healthy backup nodes available for failover");
+        return;
+      }
+
+      const targetNode = this.lavalink.nodeManager.leastUsedNodes()[0] || healthyNodes[0];
+
+      for (const player of affectedPlayers) {
+        try {
+          await player.changeNode(targetNode, false).catch(() => {});
+
+          const s = state(player.guildId);
+          if (s.ultraHd) {
+            await applyAudioQualityProfile(player, s.hdProfile).catch(() => {});
+          }
+
+          const ch: any = this.client.channels.cache.get(player.textChannelId);
+          if (ch?.isTextBased?.()) {
+            await ch.send({
+              content: `🛡️ **Failover Otomatis**: Server audio \`${node.id}\` terputus. Musik otomatis dialihkan ke server cadangan **${targetNode.id}** (\`${targetNode.options.host}\`) tanpa terhenti!`,
+            }).catch(() => {});
+          }
+        } catch (err: any) {
+          log.error({ err, guildId: player.guildId }, "Failover player migration failed");
+        }
+      }
     });
 
     this.lavalink.on("trackStart", async (player: any, track: any) => {
@@ -205,6 +234,27 @@ export class MusicService {
       log.warn({ guild: player.guildId, track: trackTitle(track), payload }, "Track error");
       const ch: any = this.client.channels.cache.get(player.textChannelId);
       const reason = payload?.exception?.message || payload?.error || "Gagal memutar audio.";
+
+      // Jika error karena blokir IP YouTube atau koneksi gagal, coba failover ke node cadangan
+      const isRecoverableError = /login|all clients failed|sign in|blocked|rate limit|connection reset/i.test(reason);
+      if (isRecoverableError && config.autoFailover) {
+        const otherNodes = Array.from(this.lavalink.nodeManager.nodes.values()).filter(
+          (n: any) => n.id !== player.node?.id && n.connected
+        );
+        if (otherNodes.length > 0) {
+          const backupNode = otherNodes[0];
+          log.info({ from: player.node?.id, to: backupNode.id }, "Switching to backup node due to track error");
+          await player.changeNode(backupNode, false).catch(() => {});
+          await ch?.send?.(`🔄 Terjadi kendala pemutaran di server \`${player.node?.id}\`. Mengalihkan ke server cadangan **${backupNode.id}**...`).catch?.(() => {});
+          const s = state(player.guildId);
+          if (s.ultraHd) {
+            await applyAudioQualityProfile(player, s.hdProfile).catch(() => {});
+          }
+          await player.play({ track }).catch(() => {});
+          return;
+        }
+      }
+
       await ch?.send?.(`⚠️ Gagal memutar **${truncate(trackTitle(track), 60)}**: ${reason}`).catch?.(() => {});
     });
 
@@ -333,18 +383,21 @@ export class MusicService {
     const allNodes = Array.from(this.lavalink.nodeManager.nodes.values());
     const activeNodes = allNodes.filter(n => n.connected);
     if (!activeNodes.length) {
-      const anyNode = allNodes[0];
+      const summary = allNodes.map(n => `• \`${n.id}\` (${n.options.host}): ${n.connected ? "Connected" : "Disconnected/Reconnecting"}`).join("\n");
       throw new Error(
-        `Server audio (Lavalink) belum terhubung atau sedang offline.\n` +
-        `• Host: \`${config.lavalink.host}:${config.lavalink.port}\`\n` +
-        `• Status: ${anyNode ? (anyNode.connected ? "Connected" : "Disconnected / Reconnecting") : "Tidak ada node"}\n` +
-        `Pastikan server Lavalink aktif dan kredensial di .env sudah benar.`
+        `Semua server audio (Lavalink) sedang offline atau belum terhubung.\n` +
+        (summary || `• Host: \`${config.lavalink.host}:${config.lavalink.port}\``) + `\n` +
+        `Bot sedang berusaha menyambung ulang secara otomatis ke semua host.`
       );
     }
 
     const targetNode = this.lavalink.nodeManager.leastUsedNodes()[0] || activeNodes[0];
 
     let player = this.getPlayer(ctx.guildId);
+
+    if (player && (!player.node || !player.node.connected)) {
+      await player.changeNode(targetNode, false).catch(() => {});
+    }
 
     if (player && player.connected && player.voiceChannelId && player.voiceChannelId !== voice.id) {
       const currentChannel = ctx.member.guild.channels.cache.get(player.voiceChannelId);
@@ -817,6 +870,8 @@ export class MusicService {
             "• `?loop [off|track|queue]` / `/loop` — Mengatur mode perulangan\n" +
             "• `?autoplay [on|off]` / `/autoplay` — Menyalakan/mematikan pemutaran otomatis\n" +
             "• `?hd [studio|bass|vocal|off]` / `/ultrahd` — Pengaturan kualitas audio Ultra HD\n" +
+            "• `?nodes` / `/nodes` — Menampilkan status cluster node Lavalink & auto-failover\n" +
+            "• `?changenode <host/nomor>` / `/changenode` — Pindah ke host audio cadangan secara manual\n" +
             "• `?leave` / `/leave` — Memerintahkan bot keluar dari voice channel\n" +
             "• `?ping` / `/ping` — Menampilkan latensi bot"
           )
@@ -906,6 +961,120 @@ export class MusicService {
       .setFooter({ text: "Gunakan ?hd <profil> atau /ultrahd" });
 
     return ctx.reply({ embeds: [embed] });
+  }
+
+  async nodes(ctx: Ctx) {
+    const allNodes = Array.from(this.lavalink.nodeManager.nodes.values());
+    const p = this.getPlayer(ctx.guildId);
+    const currentPlayerNodeId = p?.node?.id || p?.node?.options?.id;
+
+    if (!allNodes.length) {
+      return ctx.reply({ content: "❌ Tidak ada node Lavalink yang terdaftar di konfigurasi." });
+    }
+
+    const connectedCount = allNodes.filter(n => n.connected).length;
+    const descLines: string[] = [
+      `Sistem cluster audio ANTIMUSIC dilengkapi **Multi-Node Failover Otomatis**.\n` +
+      `Jika satu host mengalami kendala/disconnect, pemutaran musik akan **otomatis dialihkan ke host lain yang aktif** tanpa terputus.\n`,
+      `**Status Cluster:** \`${connectedCount}/${allNodes.length} Host Terhubung\` • **Auto-Failover:** \`${config.autoFailover ? "AKTIF 🛡️" : "NONAKTIF"}\`\n`,
+    ];
+
+    allNodes.forEach((node, idx) => {
+      const isCurrent = currentPlayerNodeId === node.id || currentPlayerNodeId === node.options?.id;
+      const statusIcon = node.connected ? "🟢" : "🔴";
+      const statusText = node.connected ? "Connected" : "Disconnected / Reconnecting";
+      const rawPing = (node as any).heartBeatPing ?? (node as any).ping?.lavalink;
+      const ping = rawPing ? `${rawPing}ms` : (node.connected ? "Active" : "Offline");
+      const players = node.stats?.players ?? 0;
+      const playing = node.stats?.playingPlayers ?? 0;
+
+      let memStr = "";
+      if (node.stats?.memory?.used) {
+        const usedMb = Math.round(node.stats.memory.used / 1024 / 1024);
+        memStr = ` • RAM: ${usedMb}MB`;
+      }
+
+      descLines.push(
+        `${statusIcon} **${idx + 1}. ${node.id}** ${isCurrent ? "*(Sedang Digunakan Server Ini 🎧)*" : ""}\n` +
+        `• Host: \`${node.options.host}:${node.options.port}\` (${node.options.secure ? "SSL" : "No-SSL"})\n` +
+        `• Status: **${statusText}** • Ping: \`${ping}\` • Load: \`${playing}/${players} playing\`${memStr}`
+      );
+    });
+
+    descLines.push(
+      `\n💡 *Tips:* Gunakan \`?changenode <nomor/nama>\` atau \`/changenode\` jika kamu ingin memindahkan server audio secara manual.`
+    );
+
+    const embed = baseEmbed("🌐 ANTIMUSIC • Lavalink Multi-Node Cluster")
+      .setDescription(descLines.join("\n"))
+      .setFooter({ text: "Sistem failover otomatis aktif 24/7" });
+
+    return ctx.reply({ embeds: [embed] });
+  }
+
+  async changeNode(ctx: Ctx, targetInput: string) {
+    const raw = targetInput?.trim();
+    if (!raw) {
+      return ctx.reply({
+        content: "❌ Masukkan nama atau nomor host yang ingin dituju. Contoh: `?changenode 2` atau `?changenode Lavalink-Backup-Millo`. Ketik `?nodes` untuk melihat daftar host."
+      });
+    }
+
+    const p = this.getPlayer(ctx.guildId);
+    if (!p || !p.connected) {
+      return ctx.reply({ content: "❌ Bot belum terhubung ke voice channel di server ini." });
+    }
+
+    const allNodes = Array.from(this.lavalink.nodeManager.nodes.values());
+    let targetNode: any = null;
+
+    if (/^\d+$/.test(raw)) {
+      const idx = Number(raw) - 1;
+      targetNode = allNodes[idx];
+    } else {
+      targetNode = allNodes.find(
+        n => n.id.toLowerCase() === raw.toLowerCase() ||
+             n.options.host.toLowerCase().includes(raw.toLowerCase())
+      );
+    }
+
+    if (!targetNode) {
+      return ctx.reply({
+        content: `❌ Host \`${raw}\` tidak ditemukan. Ketik \`?nodes\` untuk melihat daftar host yang tersedia.`
+      });
+    }
+
+    if (!targetNode.connected) {
+      return ctx.reply({
+        content: `❌ Host **${targetNode.id}** saat ini sedang offline / reconnecting. Pilih host lain yang bertanda 🟢 Connected.`
+      });
+    }
+
+    if (p.node?.id === targetNode.id) {
+      return ctx.reply({
+        content: `ℹ️ Bot sudah terhubung ke host **${targetNode.id}** (\`${targetNode.options.host}\`).`
+      });
+    }
+
+    const prevNodeId = p.node?.id || "Unknown";
+    await p.changeNode(targetNode, false);
+
+    const s = state(ctx.guildId);
+    if (s.ultraHd) {
+      await applyAudioQualityProfile(p, s.hdProfile).catch(() => {});
+    }
+
+    return ctx.reply({
+      embeds: [
+        baseEmbed("🔄 Migrasi Host Audio Berhasil")
+          .setDescription(
+            `Server audio pemutaran musik berhasil dipindahkan!\n\n` +
+            `• **Dari:** \`${prevNodeId}\`\n` +
+            `• **Ke:** 🟢 **${targetNode.id}** (\`${targetNode.options.host}:${targetNode.options.port}\`)\n` +
+            `• **Status Pemutaran:** Berjalan mulus tanpa henti!`
+          )
+      ]
+    });
   }
 
   async smartAutoplay(player: any): Promise<boolean> {

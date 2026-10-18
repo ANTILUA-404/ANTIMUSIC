@@ -100,6 +100,10 @@ client.on("interactionCreate", async i => {
         return void await music.leave(ctx);
       case "ultrahd":
         return void await music.ultrahd(ctx, i.options.getString("profile"));
+      case "nodes":
+        return void await music.nodes(ctx);
+      case "changenode":
+        return void await music.changeNode(ctx, i.options.getString("target", true));
       case "help":
         return void await music.help(ctx);
       case "ping":
@@ -173,6 +177,8 @@ client.on("messageCreate", async (m: Message) => {
 
     if (["leave", "disconnect", "dc"].includes(cmd)) return void await music.leave(ctx);
     if (["ultrahd", "hd", "eq", "audio"].includes(cmd)) return void await music.ultrahd(ctx, arg);
+    if (["nodes", "cluster", "hosts"].includes(cmd)) return void await music.nodes(ctx);
+    if (["changenode", "switch", "movenode"].includes(cmd)) return void await music.changeNode(ctx, arg);
     if (cmd === "ping") return void await music.ping(ctx);
     if (["help", "h"].includes(cmd)) return void await music.help(ctx);
   } catch (e: any) {
