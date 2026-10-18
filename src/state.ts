@@ -3,7 +3,16 @@ import path from "node:path";
 import { config } from "./config.js";
 import { log } from "./logger.js";
 
-type GuildState = { autoplay: boolean; loop: "off" | "track" | "queue"; volume: number; history: string[] };
+export type HDProfile = "ultrahd" | "bassboost" | "vocal" | "off";
+
+export type GuildState = {
+  autoplay: boolean;
+  loop: "off" | "track" | "queue";
+  volume: number;
+  history: string[];
+  ultraHd: boolean;
+  hdProfile: HDProfile;
+};
 type DB = { guilds: Record<string, GuildState> };
 const file = path.resolve("data/state.json");
 let db: DB = { guilds: {} };
@@ -40,12 +49,16 @@ export function state(guildId: string): GuildState {
       loop: "off",
       volume: config.defaultVolume,
       history: [],
+      ultraHd: true,
+      hdProfile: "ultrahd",
     };
   }
   const s = db.guilds[guildId];
   if (!Array.isArray(s.history)) s.history = [];
   if (!["off", "track", "queue"].includes(s.loop)) s.loop = "off";
   if (typeof s.volume !== "number" || isNaN(s.volume)) s.volume = config.defaultVolume;
+  if (typeof s.ultraHd !== "boolean") s.ultraHd = true;
+  if (!["ultrahd", "bassboost", "vocal", "off"].includes(s.hdProfile)) s.hdProfile = "ultrahd";
   return s;
 }
 

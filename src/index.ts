@@ -98,6 +98,8 @@ client.on("interactionCreate", async i => {
         return void await music.seek(ctx, i.options.getString("time", true));
       case "leave":
         return void await music.leave(ctx);
+      case "ultrahd":
+        return void await music.ultrahd(ctx, i.options.getString("profile"));
       case "help":
         return void await music.help(ctx);
       case "ping":
@@ -170,6 +172,7 @@ client.on("messageCreate", async (m: Message) => {
     }
 
     if (["leave", "disconnect", "dc"].includes(cmd)) return void await music.leave(ctx);
+    if (["ultrahd", "hd", "eq", "audio"].includes(cmd)) return void await music.ultrahd(ctx, arg);
     if (cmd === "ping") return void await music.ping(ctx);
     if (["help", "h"].includes(cmd)) return void await music.help(ctx);
   } catch (e: any) {

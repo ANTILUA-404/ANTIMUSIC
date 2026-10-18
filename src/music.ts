@@ -3,9 +3,10 @@ import {
   GuildMember, Message, MessageFlags, PermissionFlagsBits, TextBasedChannel
 } from "discord.js";
 import { LavalinkManager } from "lavalink-client";
+import { applyAudioQualityProfile, optimizeVoiceChannelBitrate, PROFILE_INFO } from "./audio-hd.js";
 import { config } from "./config.js";
 import { log } from "./logger.js";
-import { patchState, remember, state } from "./state.js";
+import { HDProfile, patchState, remember, state } from "./state.js";
 import {
   baseEmbed, isUrl, ms, normalizeQuery, parseSeconds,
   requesterName, trackArtwork, trackAuthor, trackLength, trackTitle, trackUri, truncate
@@ -177,6 +178,11 @@ export class MusicService {
       this.lastTrack.set(player.guildId, track);
       remember(player.guildId, track?.info?.identifier || trackUri(track) || trackTitle(track));
 
+      const s = state(player.guildId);
+      if (s.ultraHd) {
+        await applyAudioQualityProfile(player, s.hdProfile).catch(() => {});
+      }
+
       const ch: any = this.client.channels.cache.get(player.textChannelId);
       if (!ch?.isTextBased?.()) return;
 
@@ -295,7 +301,9 @@ export class MusicService {
         { name: "Requester", value: requesterName(track, this.client.user?.id), inline: true },
         { name: "Autoplay", value: guildState.autoplay ? "ON 🟢" : "OFF ⚪", inline: true },
         { name: "Loop", value: `${player.repeatMode || guildState.loop}`.toUpperCase(), inline: true },
-      );
+        { name: "Kualitas Audio", value: guildState.ultraHd ? `${PROFILE_INFO[guildState.hdProfile].emoji} **${PROFILE_INFO[guildState.hdProfile].label}**` : "⚪ Standard Flat", inline: true },
+      )
+      .setFooter({ text: "💎 Ultra HD Studio Engine • 48kHz Stereo Opus" });
 
     const art = trackArtwork(track);
     if (art) e.setThumbnail(art);
@@ -378,6 +386,11 @@ export class MusicService {
         player.voiceChannelId = voice.id;
         await player.connect();
       }
+    }
+
+    await optimizeVoiceChannelBitrate(voice).catch(() => {});
+    if (s.ultraHd) {
+      await applyAudioQualityProfile(player, s.hdProfile).catch(() => {});
     }
 
     return player;
@@ -803,12 +816,96 @@ export class MusicService {
             "• `?remove <nomor>` / `/remove` — Menghapus lagu tertentu dari antrean\n" +
             "• `?loop [off|track|queue]` / `/loop` — Mengatur mode perulangan\n" +
             "• `?autoplay [on|off]` / `/autoplay` — Menyalakan/mematikan pemutaran otomatis\n" +
+            "• `?hd [studio|bass|vocal|off]` / `/ultrahd` — Pengaturan kualitas audio Ultra HD\n" +
             "• `?leave` / `/leave` — Memerintahkan bot keluar dari voice channel\n" +
             "• `?ping` / `/ping` — Menampilkan latensi bot"
           )
           .setFooter({ text: "Gunakan prefix ? atau Slash Commands (/)" }),
       ],
     });
+  }
+
+  async ultrahd(ctx: Ctx, profileInput?: string | null) {
+    const raw = profileInput?.trim().toLowerCase();
+    const guildState = state(ctx.guildId);
+    const player = this.getPlayer(ctx.guildId);
+
+    const voice = this.voiceChannel(ctx);
+    let bitrateInfo = { previousBitrate: 64000, currentBitrate: 64000, maxBitrate: 96000, boosted: false, canManage: false };
+    if (voice) {
+      bitrateInfo = await optimizeVoiceChannelBitrate(voice);
+    }
+
+    if (raw) {
+      let targetProfile: HDProfile | null = null;
+      if (["ultrahd", "hd", "studio", "on", "enable", "master"].includes(raw)) {
+        targetProfile = "ultrahd";
+      } else if (["bass", "bassboost", "heavybass"].includes(raw)) {
+        targetProfile = "bassboost";
+      } else if (["vocal", "acoustic", "clarity", "clear"].includes(raw)) {
+        targetProfile = "vocal";
+      } else if (["off", "flat", "disable", "none", "normal"].includes(raw)) {
+        targetProfile = "off";
+      }
+
+      if (!targetProfile) {
+        return ctx.reply({
+          content:
+            "❌ Pilihan profil audio tidak valid.\n" +
+            "Gunakan salah satu pilihan berikut:\n" +
+            "• `?hd studio` — 💎 **Ultra HD Studio Master** (Rekomendasi)\n" +
+            "• `?hd bass` — 🔊 **Ultra Bass Boost**\n" +
+            "• `?hd vocal` — 🎤 **Vocal & Acoustic Clarity**\n" +
+            "• `?hd off` — ⚪ **Standard Flat (Mati)**",
+        });
+      }
+
+      const isUltraHdActive = targetProfile !== "off";
+      patchState(ctx.guildId, { ultraHd: isUltraHdActive, hdProfile: targetProfile });
+
+      if (player && player.connected) {
+        await applyAudioQualityProfile(player, targetProfile);
+      }
+
+      const pInfo = PROFILE_INFO[targetProfile];
+      const chBitrateKbps = Math.round((voice?.bitrate ?? bitrateInfo.currentBitrate) / 1000);
+      const embed = baseEmbed(`${pInfo.emoji} Kualitas Audio: ${pInfo.label}`)
+        .setDescription(
+          `Pengaturan audio berhasil diperbarui untuk server ini!\n\n` +
+          `• **Status Ultra HD:** ${isUltraHdActive ? "🟢 Aktif (Studio Fidelity)" : "⚪ Nonaktif (Standard Flat)"}\n` +
+          `• **Deskripsi:** ${pInfo.description}\n` +
+          `• **Voice Channel Bitrate:** \`${chBitrateKbps} kbps\` ${bitrateInfo.boosted ? "*(Otomatis dimaksimalkan!)*" : ""}\n` +
+          `• **Format Output:** \`48,000 Hz Stereo Opus\``
+        )
+        .setFooter({ text: "Nikmati pengalaman mendengarkan musik dengan kualitas tertinggi di Discord!" });
+
+      return ctx.reply({ embeds: [embed] });
+    }
+
+    const curProfile = guildState.hdProfile;
+    const pInfo = PROFILE_INFO[curProfile];
+    const chBitrateKbps = Math.round((voice?.bitrate ?? bitrateInfo.currentBitrate) / 1000);
+    const maxBitrateKbps = Math.round((voice?.guild?.maximumBitrate ?? bitrateInfo.maxBitrate) / 1000);
+
+    const embed = baseEmbed("💎 ANTIMUSIC • Ultra HD Audio Engine")
+      .setDescription(
+        "ANTIMUSIC dilengkapi dengan sistem pemrosesan audio **Studio Master Ultra HD** yang mengoptimalkan spektrum frekuensi untuk voice channel Discord.\n\n" +
+        `**Status Audio Server Ini:**\n` +
+        `• **Engine Ultra HD:** ${guildState.ultraHd ? "🟢 **AKTIF (Ultra High Fidelity)**" : "⚪ Nonaktif"}\n` +
+        `• **Profil Equalizer:** ${pInfo.emoji} **${pInfo.label}**\n` +
+        `• **Detail Profil:** *${pInfo.description}*\n` +
+        `• **Voice Channel Bitrate:** \`${chBitrateKbps} kbps\` *(Batas Server: ${maxBitrateKbps} kbps)*\n` +
+        `• **Format Output:** \`48,000 Hz Stereo Opus (High Bitrate Stream)\`\n\n` +
+        `**Ganti Profil Audio:**\n` +
+        `• \`?hd studio\` — 💎 **Ultra HD Studio Master** (Optimal untuk semua genre)\n` +
+        `• \`?hd bass\` — 🔊 **Ultra Bass Boost** (Bass bertenaga untuk EDM/Phonk)\n` +
+        `• \`?hd vocal\` — 🎤 **Vocal & Acoustic Clarity** (Akustik & vokal jernih)\n` +
+        `• \`?hd off\` — ⚪ **Standard Flat** (Suara asli tanpa EQ)\n\n` +
+        `💡 *Tips:* Berikan bot izin **Manage Channels** agar bot dapat otomatis menaikkan bitrate voice channel ke batas maksimal server Discord kamu (${maxBitrateKbps} kbps)!`
+      )
+      .setFooter({ text: "Gunakan ?hd <profil> atau /ultrahd" });
+
+    return ctx.reply({ embeds: [embed] });
   }
 
   async smartAutoplay(player: any): Promise<boolean> {

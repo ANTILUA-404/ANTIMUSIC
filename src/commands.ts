@@ -26,6 +26,13 @@ export const slashCommands = [
   new SlashCommandBuilder().setName("seek").setDescription("Seek to seconds or mm:ss (e.g. 90 or 1:30)")
     .addStringOption(o => o.setName("time").setDescription("Time in seconds or mm:ss (e.g. 90 or 1:30)").setRequired(true)),
   new SlashCommandBuilder().setName("leave").setDescription("Leave voice channel"),
+  new SlashCommandBuilder().setName("ultrahd").setDescription("Audio Engine Ultra HD Studio (Status & EQ Profiles)")
+    .addStringOption(o => o.setName("profile").setDescription("Pilih profil audio").setRequired(false).addChoices(
+      { name: "💎 Ultra HD Studio Master (Default)", value: "ultrahd" },
+      { name: "🔊 Ultra Bass Boost", value: "bassboost" },
+      { name: "🎤 Vocal & Acoustic Clarity", value: "vocal" },
+      { name: "⚪ Standard Flat (Off)", value: "off" }
+    )),
   new SlashCommandBuilder().setName("help").setDescription("Show ANTIMUSIC commands"),
   new SlashCommandBuilder().setName("ping").setDescription("Show bot latency")
 ].map(x => x.toJSON());
