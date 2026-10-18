@@ -20,6 +20,22 @@ export type Ctx = {
   edit?: (payload: any) => Promise<any>;
 };
 
+async function getYoutubeTitleFromUrl(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as any;
+    const title = data?.title?.trim();
+    const author = data?.author_name?.trim();
+    if (!title) return null;
+    return author ? `${title} ${author}` : title;
+  } catch {
+    return null;
+  }
+}
+
 export class MusicService {
   public lavalink: LavalinkManager;
   private lastTrack = new Map<string, any>();
@@ -396,6 +412,26 @@ export class MusicService {
         /login|all clients failed|sign in/i.test(result.exception?.message || "")
       );
 
+      let fallbackNote: string | null = null;
+
+      // Jika link langsung YouTube diblokir oleh IP server, ambil judul via oEmbed dan cari di SoundCloud
+      if (isDirectUrl && isYoutubeBlocked && /(youtube\.com|youtu\.be)/i.test(searchQuery)) {
+        log.warn({ url: searchQuery }, "Link YouTube diblokir IP. Mencari judul via oEmbed untuk fallback SoundCloud...");
+        const ytTitle = await getYoutubeTitleFromUrl(searchQuery);
+        if (ytTitle) {
+          try {
+            const scResult: any = await player.search(
+              { query: ytTitle, source: "scsearch" },
+              ctx.user
+            );
+            if (scResult && scResult.loadType !== "error" && scResult.tracks?.length) {
+              result = scResult;
+              fallbackNote = "Diputar via SoundCloud karena YouTube memblokir akses server";
+            }
+          } catch {}
+        }
+      }
+
       // Jika pencarian YouTube diblokir IP/login atau tidak ditemukan, otomatis fallback ke SoundCloud (scsearch)
       if ((!result || result.loadType === "empty" || isYoutubeBlocked) && !isDirectUrl) {
         log.warn({ query: searchQuery }, "YouTube terblokir / requires login. Mencoba fallback ke SoundCloud (scsearch)...");
@@ -459,10 +495,14 @@ export class MusicService {
       const author = trackAuthor(firstTrack);
       const uri = trackUri(firstTrack);
 
+      const desc = uri
+        ? `**[${truncate(title, 80)}](${uri})**\n${author}${fallbackNote ? `\n\nℹ️ *${fallbackNote}*` : ""}`
+        : `**${truncate(title, 80)}**\n${author}${fallbackNote ? `\n\nℹ️ *${fallbackNote}*` : ""}`;
+
       return ctx.reply({
         embeds: [
           baseEmbed("✅ Ditambahkan ke Queue")
-            .setDescription(uri ? `**[${truncate(title, 80)}](${uri})**\n${author}` : `**${truncate(title, 80)}**\n${author}`)
+            .setDescription(desc)
             .setFooter({ text: `Posisi di antrean: #${player.queue?.tracks?.length ?? 1}` }),
         ],
       });
