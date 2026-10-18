@@ -1,0 +1,29 @@
+services:
+  lavalink:
+    image: ghcr.io/lavalink-devs/lavalink:4.2.2
+    restart: unless-stopped
+    environment:
+      _JAVA_OPTIONS: "-Xmx512M"
+    volumes:
+      - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      - lavalink-plugins:/opt/Lavalink/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header='Authorization: antimusic-super-secret' http://127.0.0.1:2333/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    ports:
+      - "${HEALTH_PORT:-3000}:${HEALTH_PORT:-3000}"
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  lavalink-plugins:
