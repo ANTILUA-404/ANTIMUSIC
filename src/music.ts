@@ -27,10 +27,17 @@ async function getYoutubeTitleFromUrl(url: string): Promise<string | null> {
     });
     if (!res.ok) return null;
     const data = (await res.json()) as any;
-    const title = data?.title?.trim();
-    const author = data?.author_name?.trim();
-    if (!title) return null;
-    return author ? `${title} ${author}` : title;
+    const rawTitle = data?.title?.trim();
+    if (!rawTitle) return null;
+
+    const cleanTitle = rawTitle
+      .replace(/\|+/g, " ")
+      .replace(/\[[^\]]*\]/g, " ")
+      .replace(/\((official\s*(music)?\s*video|official\s*audio|lyrics?|remaster(ed)?)\)/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return cleanTitle || rawTitle;
   } catch {
     return null;
   }
@@ -420,13 +427,24 @@ export class MusicService {
         const ytTitle = await getYoutubeTitleFromUrl(searchQuery);
         if (ytTitle) {
           try {
-            const scResult: any = await player.search(
+            let scResult: any = await player.search(
               { query: ytTitle, source: "scsearch" },
               ctx.user
-            );
+            ).catch(() => null);
+
+            if (!scResult?.tracks?.length || scResult?.loadType === "error") {
+              const simpler = ytTitle.replace(/-.*/, "").trim();
+              if (simpler && simpler.length > 2) {
+                scResult = await player.search(
+                  { query: simpler, source: "scsearch" },
+                  ctx.user
+                ).catch(() => null);
+              }
+            }
+
             if (scResult && scResult.loadType !== "error" && scResult.tracks?.length) {
               result = scResult;
-              fallbackNote = "Diputar via SoundCloud karena YouTube memblokir akses server";
+              fallbackNote = `Diputar via SoundCloud (pencarian: "${ytTitle}")`;
             }
           } catch {}
         }
