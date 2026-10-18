@@ -25,7 +25,7 @@ export const config = {
   lavalink: {
     host: cleanHost,
     port: num(process.env.LAVALINK_PORT, isHttps ? 443 : 2333),
-    authorization: process.env.LAVALINK_PASSWORD?.trim() || "antimusic-super-secret",
+    authorization: (process.env.LAVALINK_PASSWORD?.trim() || "antimusic-super-secret").replace(/^["']|["']$/g, ""),
     secure: bool(process.env.LAVALINK_SECURE, isHttps),
   },
   logLevel: process.env.LOG_LEVEL?.trim() || "info",
