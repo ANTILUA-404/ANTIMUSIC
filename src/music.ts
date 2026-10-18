@@ -382,13 +382,43 @@ export class MusicService {
       const searchQuery = normalizeQuery(query);
       const isDirectUrl = isUrl(searchQuery);
 
-      const result: any = await player.search(
-        { query: searchQuery, source: isDirectUrl ? undefined : "ytmsearch" },
-        ctx.user
+      let result: any = null;
+      try {
+        result = await player.search(
+          { query: searchQuery, source: isDirectUrl ? undefined : "ytmsearch" },
+          ctx.user
+        );
+      } catch (err: any) {
+        result = { loadType: "error", exception: { message: err?.message || String(err) } };
+      }
+
+      const isYoutubeBlocked = result?.loadType === "error" && (
+        /login|all clients failed|sign in/i.test(result.exception?.message || "")
       );
 
+      // Jika pencarian YouTube diblokir IP/login atau tidak ditemukan, otomatis fallback ke SoundCloud (scsearch)
+      if ((!result || result.loadType === "empty" || isYoutubeBlocked) && !isDirectUrl) {
+        log.warn({ query: searchQuery }, "YouTube terblokir / requires login. Mencoba fallback ke SoundCloud (scsearch)...");
+        try {
+          const scResult: any = await player.search(
+            { query: searchQuery, source: "scsearch" },
+            ctx.user
+          );
+          if (scResult && scResult.loadType !== "error" && scResult.tracks?.length) {
+            result = scResult;
+          }
+        } catch {}
+      }
+
       if (result?.loadType === "error") {
-        throw new Error(result.exception?.message || "Gagal memuat lagu dari sumber audio.");
+        const errMsg = result.exception?.message || "Gagal memuat lagu dari sumber audio.";
+        if (/login|all clients failed|sign in/i.test(errMsg)) {
+          throw new Error(
+            `Server Lavalink terkena blokir IP YouTube (This video requires login).\n` +
+            `💡 **Solusi:** Aktifkan YouTube OAuth di Lavalink, atau coba ketik: \`?play sc:${searchQuery}\` untuk memutar lewat SoundCloud.`
+          );
+        }
+        throw new Error(errMsg);
       }
 
       if (!result?.tracks?.length || result.loadType === "empty") {
@@ -757,10 +787,17 @@ export class MusicService {
       const query = cleanAuthor ? `${cleanAuthor} ${cleanTitle}` : cleanTitle;
       if (!query) return false;
 
-      const result: any = await player.search(
+      let result: any = await player.search(
         { query, source: "ytmsearch" },
         this.client.user
-      );
+      ).catch(() => null);
+
+      if (!result?.tracks?.length || result?.loadType === "error") {
+        result = await player.search(
+          { query, source: "scsearch" },
+          this.client.user
+        ).catch(() => null);
+      }
 
       const seedId = seed?.info?.identifier;
       const candidates = (result?.tracks || []).filter((t: any) => {
