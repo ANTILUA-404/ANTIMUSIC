@@ -51,6 +51,7 @@ export class MusicService {
   private emptyTimers = new Map<string, NodeJS.Timeout>();
   private npMessages = new Map<string, Message>();
   private nodeCooldowns = new Map<string, number>();
+  private autoplayPool = new Map<string, any[]>();
 
   public markNodeDegraded(nodeId: string, durationMs = 45_000) {
     this.nodeCooldowns.set(nodeId, Date.now() + durationMs);
@@ -60,6 +61,47 @@ export class MusicService {
     if (!node || !node.connected || !node.info) return false;
     const cooldownUntil = this.nodeCooldowns.get(node.id) || 0;
     return Date.now() > cooldownUntil;
+  }
+
+  private cleanTitleForCompare(t: string): string {
+    return (t || "")
+      .toLowerCase()
+      .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+      .replace(/(official\s*(music)?\s*video|official\s*audio|lyrics?|full\s*album|cover|remix|acoustic|live|slowed|reverb|hd|4k|audio|video)/gi, " ")
+      .replace(/[^a-z0-9\s]/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private isSameSong(t1: string, t2: string): boolean {
+    const c1 = this.cleanTitleForCompare(t1);
+    const c2 = this.cleanTitleForCompare(t2);
+    if (!c1 || !c2) return false;
+    if (c1 === c2) return true;
+    if (c1.includes(c2) || c2.includes(c1)) return true;
+
+    const words1 = new Set(c1.split(" ").filter(w => w.length > 2));
+    const words2 = new Set(c2.split(" ").filter(w => w.length > 2));
+    if (!words1.size || !words2.size) return false;
+
+    let match = 0;
+    for (const w of words1) if (words2.has(w)) match++;
+    const ratio = match / Math.max(words1.size, words2.size);
+    return ratio >= 0.55;
+  }
+
+  private extractYouTubeVideoId(track: any): string | null {
+    if (!track) return null;
+    const identifier = track?.info?.identifier;
+    if (identifier && /^[a-zA-Z0-9_-]{11}$/.test(identifier) && (!track?.info?.sourceName || track?.info?.sourceName === "youtube")) {
+      return identifier;
+    }
+    const uri = trackUri(track);
+    if (uri) {
+      const match = uri.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
+      if (match) return match[1];
+    }
+    return null;
   }
 
   constructor(private client: Client) {
@@ -679,6 +721,7 @@ export class MusicService {
 
     try {
       const player = await this.ensurePlayer(ctx);
+      this.autoplayPool.delete(ctx.guildId);
       const currentQueueSize = player.queue?.tracks?.length ?? 0;
       if (currentQueueSize >= config.maxQueueSize) {
         throw new Error(`Queue sudah mencapai batas maksimal ${config.maxQueueSize} track.`);
@@ -781,6 +824,7 @@ export class MusicService {
     if (!this.sameVoice(ctx, p)) return ctx.reply({ content: "❌ Kamu harus berada di voice channel yang sama dengan bot." });
 
     this.stopNowPlayingUpdater(ctx.guildId);
+    this.autoplayPool.delete(ctx.guildId);
     if (p.queue?.tracks?.length) {
       await p.queue.splice(0, p.queue.tracks.length).catch(() => {});
     }
@@ -850,6 +894,7 @@ export class MusicService {
     const count = p.queue?.tracks?.length ?? 0;
     if (count === 0) return ctx.reply({ content: "❌ Antrean lagu sudah kosong." });
 
+    this.autoplayPool.delete(ctx.guildId);
     await p.queue.splice(0, count);
     await p.queue.utils?.save?.();
     return ctx.reply({ content: `🧹 Berhasil membersihkan **${count}** lagu dari antrean.` });
@@ -860,6 +905,9 @@ export class MusicService {
     const nextState = enabled == null ? !current : !!enabled;
 
     patchState(ctx.guildId, { autoplay: nextState });
+    if (!nextState) {
+      this.autoplayPool.delete(ctx.guildId);
+    }
 
     const p = this.getPlayer(ctx.guildId);
     if (p) {
@@ -954,6 +1002,7 @@ export class MusicService {
     if (!this.sameVoice(ctx, p)) return ctx.reply({ content: "❌ Kamu harus berada di voice channel yang sama dengan bot." });
 
     this.stopNowPlayingUpdater(ctx.guildId);
+    this.autoplayPool.delete(ctx.guildId);
     await p.destroy();
     return ctx.reply({ content: "👋 ANTIMUSIC keluar dari voice channel." });
   }
@@ -1263,35 +1312,88 @@ export class MusicService {
       if (!seed) return false;
 
       const s = state(guildId);
-      const author = trackAuthor(seed);
-      const cleanAuthor = (!author || author.toLowerCase() === "unknown")
+      const seedTitle = trackTitle(seed);
+      const seedAuthor = trackAuthor(seed);
+      const cleanAuthor = (!seedAuthor || seedAuthor.toLowerCase() === "unknown")
         ? ""
-        : author.replace(/\s*-\s*Topic$/i, "").replace(/VEVO$/i, "").trim();
+        : seedAuthor.replace(/\s*-\s*Topic$/i, "").replace(/VEVO$/i, "").trim();
 
-      const cleanTitle = trackTitle(seed)
-        .replace(/\([^)]*\)|\[[^\]]*\]/g, "")
-        .replace(/(official\s*(music)?\s*video|official\s*audio|lyrics?|full\s*album)/gi, "")
-        .trim();
+      const seedId = seed?.info?.identifier || trackUri(seed);
 
-      const query = cleanAuthor ? `${cleanAuthor} ${cleanTitle}` : cleanTitle;
-      if (!query) return false;
-
-      const searchRes = await this.searchWithClusterFailover(
-        player,
-        query,
-        false,
-        this.client.user
-      ).catch(() => null);
-
-      const result: any = searchRes?.result;
-
-      const seedId = seed?.info?.identifier;
-      const candidates = (result?.tracks || []).filter((t: any) => {
-        const id = t?.info?.identifier || trackUri(t) || trackTitle(t);
-        return id && !s.history.includes(id) && id !== seedId;
+      // 1. Cek apakah di autoplayPool guild ini masih ada sisa lagu rekomendasi yang valid
+      let pool = this.autoplayPool.get(guildId) || [];
+      pool = pool.filter((t: any) => {
+        const id = t?.info?.identifier || trackUri(t);
+        const title = trackTitle(t);
+        if (!id || s.history.includes(id) || id === seedId) return false;
+        if (this.isSameSong(title, seedTitle)) return false;
+        return true;
       });
 
-      const next = candidates[0] || result?.tracks?.find((t: any) => (t?.info?.identifier || trackTitle(t)) !== seedId);
+      // 2. Jika pool kosong atau habis, racik rekomendasi baru ala YouTube Music / Spotify Radio Mix
+      if (!pool.length) {
+        log.info({ guildId, seedTitle, cleanAuthor }, "Autoplay pool kosong. Mengambil racikan rekomendasi Radio Mix...");
+
+        let videoId = this.extractYouTubeVideoId(seed);
+
+        // Jika lagu awal bukan dari YouTube (misal Spotify), cari dulu video ID YouTube resminya
+        if (!videoId) {
+          const quickQuery = cleanAuthor ? `${cleanAuthor} ${seedTitle}` : seedTitle;
+          const searchYt = await this.searchWithClusterFailover(player, quickQuery, false, this.client.user).catch(() => null);
+          const topTrack = searchYt?.result?.tracks?.[0];
+          if (topTrack) {
+            videoId = this.extractYouTubeVideoId(topTrack);
+          }
+        }
+
+        let mixTracks: any[] = [];
+
+        // Tier 1: YouTube Radio Mix Playlist (list=RD${videoId}) — Algoritma resmi rekomendasi YouTube / YT Music
+        if (videoId) {
+          const radioMixUrl = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+          const mixRes = await this.searchWithClusterFailover(player, radioMixUrl, true, this.client.user).catch(() => null);
+          if (mixRes?.result?.tracks?.length) {
+            mixTracks = mixRes.result.tracks;
+            log.info({ videoId, count: mixTracks.length }, "Berhasil memuat YouTube Radio Mix playlist");
+          }
+        }
+
+        // Tier 2: YouTube Music Radio / Playlist Mix Search jika Tier 1 tidak ada hasil
+        if (!mixTracks.length && cleanAuthor) {
+          const queries = [
+            `ytmsearch:${cleanAuthor} radio`,
+            `ytsearch:${cleanAuthor} popular mix playlist`,
+            `ytmsearch:${cleanAuthor}`,
+          ];
+          for (const q of queries) {
+            const fallbackRes = await this.searchWithClusterFailover(player, q, false, this.client.user).catch(() => null);
+            if (fallbackRes?.result?.tracks?.length) {
+              mixTracks = fallbackRes.result.tracks;
+              break;
+            }
+          }
+        }
+
+        // Saring lagu-lagu dari mix: buang lagu yang sudah pernah diputar, dan buang lagu dengan judul yang sama (cover/remix/variasi lagu saat ini)
+        pool = mixTracks.filter((t: any) => {
+          const id = t?.info?.identifier || trackUri(t);
+          const title = trackTitle(t);
+          if (!id || s.history.includes(id) || id === seedId) return false;
+          if (this.isSameSong(title, seedTitle)) return false;
+          return true;
+        });
+      }
+
+      if (!pool.length) {
+        log.warn({ guildId, seedTitle }, "Tidak ditemukan lagu rekomendasi autoplay yang cocok");
+        return false;
+      }
+
+      // Ambil lagu pertama dari pool
+      const next = pool.shift();
+      // Simpan sisa rekomendasi ke pool guild agar lagu berikutnya langsung diambil tanpa delay
+      this.autoplayPool.set(guildId, pool);
+
       if (!next) return false;
 
       await player.queue.add(next);
@@ -1299,12 +1401,22 @@ export class MusicService {
       player.lastPositionChange = Date.now();
       await this.safePlay(player);
 
+      const nextTitle = trackTitle(next);
+      const nextUri = trackUri(next);
+      const nextAuthor = trackAuthor(next);
+
       const ch: any = this.client.channels.cache.get(player.textChannelId);
-      await ch?.send?.(`♾️ **Smart Autoplay:** Memutar rekomendasi lagu berikutnya: **[${truncate(trackTitle(next), 80)}](${trackUri(next)})**`).catch?.(() => {});
+      await ch?.send?.({
+        embeds: [
+          baseEmbed("♾️ Autoplay Radio Mix")
+            .setDescription(`Melanjutkan pemutaran dengan lagu yang seirama:\n**[${truncate(nextTitle, 80)}](${nextUri})**\n${nextAuthor}`)
+            .setFooter({ text: `Sisa antrean rekomendasi: ${pool.length} lagu seirama • ANTIMUSIC` })
+        ]
+      }).catch?.(() => {});
 
       return true;
     } catch (e) {
-      log.warn({ e, guildId }, "Smart autoplay search failed");
+      log.warn({ e, guildId }, "Smart autoplay failed");
       return false;
     } finally {
       this.autoplayBusy.delete(guildId);
