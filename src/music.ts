@@ -50,6 +50,17 @@ export class MusicService {
   private autoplayBusy = new Set<string>();
   private emptyTimers = new Map<string, NodeJS.Timeout>();
   private npMessages = new Map<string, Message>();
+  private nodeCooldowns = new Map<string, number>();
+
+  public markNodeDegraded(nodeId: string, durationMs = 45_000) {
+    this.nodeCooldowns.set(nodeId, Date.now() + durationMs);
+  }
+
+  public isNodeHealthy(node: any): boolean {
+    if (!node || !node.connected || !node.info) return false;
+    const cooldownUntil = this.nodeCooldowns.get(node.id) || 0;
+    return Date.now() > cooldownUntil;
+  }
 
   constructor(private client: Client) {
     this.lavalink = new LavalinkManager({
@@ -148,15 +159,18 @@ export class MusicService {
   private registerEvents() {
     this.lavalink.nodeManager.on("connect", (node: any) => {
       log.info({ node: node.id, host: node.options.host, port: node.options.port }, "Lavalink connected");
+      this.nodeCooldowns.delete(node.id);
       node.updateSession?.(true, 300_000).catch?.(() => {});
     });
 
     this.lavalink.nodeManager.on("error", (node: any, error: any) => {
       log.error({ node: node.id, error: error?.message || error }, "Lavalink node error");
+      this.markNodeDegraded(node.id, 60_000);
     });
 
     this.lavalink.nodeManager.on("disconnect", async (node: any, reason: any) => {
       log.warn({ node: node.id, reason }, "Lavalink node disconnected. Checking failover candidates...");
+      this.markNodeDegraded(node.id, 90_000);
 
       if (!config.autoFailover) return;
 
@@ -167,15 +181,22 @@ export class MusicService {
       if (!affectedPlayers.length) return;
 
       const healthyNodes = Array.from(this.lavalink.nodeManager.nodes.values()).filter(
-        (n: any) => n.id !== node.id && n.connected && n.sessionId
+        (n: any) => n.id !== node.id && n.connected && n.sessionId && this.isNodeHealthy(n)
       );
 
-      if (!healthyNodes.length) {
+      const candidateNodes = healthyNodes.length
+        ? healthyNodes
+        : Array.from(this.lavalink.nodeManager.nodes.values()).filter(
+            (n: any) => n.id !== node.id && n.connected && n.info
+          );
+
+      if (!candidateNodes.length) {
         log.warn({ node: node.id }, "No healthy backup nodes available for failover");
         return;
       }
 
-      const targetNode = this.lavalink.nodeManager.leastUsedNodes()[0] || healthyNodes[0];
+      const leastUsed = this.lavalink.nodeManager.leastUsedNodes();
+      const targetNode = candidateNodes.find((c: any) => leastUsed.some((l: any) => l.id === c.id)) || candidateNodes[0];
 
       for (const player of affectedPlayers) {
         try {
@@ -365,6 +386,81 @@ export class MusicService {
     return ctx.member.voice?.channel;
   }
 
+  private getNodePriority(node: any): number {
+    const host = String(node?.options?.host || node?.host || "").toLowerCase();
+    const id = String(node?.id || "").toLowerCase();
+    if (host.includes("nazha") || id.includes("nazha")) return 1;
+    if (host.includes("jirayu") || id.includes("jirayu")) return 2;
+    if (host.includes("127.0.0.1") || host.includes("localhost") || id.includes("local")) return 3;
+    if (host.includes("serenetia") || id.includes("serenetia")) return 4;
+    return 5;
+  }
+
+  private async migratePlayerToNode(player: any, targetNode: any): Promise<boolean> {
+    if (!player || !targetNode) return false;
+    if (player.node?.id === targetNode.id) return true;
+
+    try {
+      if (player.voice?.token && player.voice?.endpoint && player.voice?.sessionId) {
+        await player.changeNode(targetNode, false);
+        return true;
+      }
+      player.node = targetNode;
+      return true;
+    } catch (err: any) {
+      log.warn({ err: err?.message || err, from: player.node?.id, to: targetNode.id }, "changeNode failed, falling back to direct assignment");
+      player.node = targetNode;
+      return true;
+    }
+  }
+
+  private async safePlay(player: any, maxRetries = 2): Promise<void> {
+    for (let i = 0; i < 20; i++) {
+      if (player.voice?.token && player.voice?.endpoint) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    let lastError: any = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        await player.play();
+        return;
+      } catch (err: any) {
+        lastError = err;
+        const msg = err?.message || String(err);
+        log.warn({ attempt, error: msg, node: player.node?.id }, "player.play() gagal. Mencoba failover ke server lain...");
+
+        if (player.node?.id) {
+          this.markNodeDegraded(player.node.id, 60_000);
+        }
+
+        const candidateNodes = Array.from(this.lavalink.nodeManager.nodes.values()).filter(
+          (n: any) => n.connected && n.info && n.id !== player.node?.id && this.isNodeHealthy(n)
+        ).sort((a: any, b: any) => this.getNodePriority(a) - this.getNodePriority(b));
+
+        if (!candidateNodes.length) {
+          break;
+        }
+
+        const nextNode = candidateNodes[0];
+        log.info({ from: player.node?.id, to: nextNode.id }, "Memindahkan player ke node cadangan...");
+        await this.migratePlayerToNode(player, nextNode);
+      }
+    }
+
+    if (lastError) {
+      const msg = lastError.message || String(lastError);
+      if (/timeout|aborted/i.test(msg)) {
+        throw new Error(
+          "Server audio mengalami timeout saat memulai pemutaran lagu.\n" +
+          "💡 **Solusi:** Coba jalankan kembali `?play <lagu>` atau gunakan `?changenode` untuk beralih ke node lain."
+        );
+      }
+      throw lastError;
+    }
+  }
+
   private async ensurePlayer(ctx: Ctx) {
     const voice = this.voiceChannel(ctx);
     if (!voice) throw new Error("Kamu harus masuk voice channel terlebih dahulu.");
@@ -381,8 +477,8 @@ export class MusicService {
     }
 
     const allNodes = Array.from(this.lavalink.nodeManager.nodes.values());
-    const activeNodes = allNodes.filter(n => n.connected);
-    if (!activeNodes.length) {
+    const connectedNodes = allNodes.filter(n => n.connected && n.info);
+    if (!connectedNodes.length) {
       const summary = allNodes.map(n => `• \`${n.id}\` (${n.options.host}): ${n.connected ? "Connected" : "Disconnected/Reconnecting"}`).join("\n");
       throw new Error(
         `Semua server audio (Lavalink) sedang offline atau belum terhubung.\n` +
@@ -391,12 +487,15 @@ export class MusicService {
       );
     }
 
-    const targetNode = this.lavalink.nodeManager.leastUsedNodes()[0] || activeNodes[0];
+    const healthyNodes = connectedNodes.filter(n => this.isNodeHealthy(n));
+    const pool = healthyNodes.length ? healthyNodes : connectedNodes;
+    const sortedPool = [...pool].sort((a, b) => this.getNodePriority(a) - this.getNodePriority(b));
+    const targetNode = sortedPool[0];
 
     let player = this.getPlayer(ctx.guildId);
 
-    if (player && (!player.node || !player.node.connected)) {
-      await player.changeNode(targetNode, false).catch(() => {});
+    if (player && (!player.node || !player.node.connected || !this.isNodeHealthy(player.node))) {
+      await this.migratePlayerToNode(player, targetNode).catch(() => {});
     }
 
     if (player && player.connected && player.voiceChannelId && player.voiceChannelId !== voice.id) {
@@ -456,6 +555,123 @@ export class MusicService {
     return !player.voiceChannelId || player.voiceChannelId === v.id;
   }
 
+  async searchWithClusterFailover(
+    player: any,
+    searchQuery: string,
+    isDirectUrl: boolean,
+    user: any
+  ): Promise<{ result: any; fallbackNote?: string }> {
+    const allConnected = Array.from(this.lavalink.nodeManager.nodes.values()).filter((n: any) => n.connected && n.info);
+    if (!allConnected.length) {
+      throw new Error(
+        "Semua server audio (Lavalink) sedang offline atau belum terhubung.\n" +
+        "Bot sedang berusaha menyambung ulang secara otomatis. Mohon tunggu beberapa saat."
+      );
+    }
+
+    // Bangun daftar prioritas node: node aktif player (jika sehat), lalu node sehat lainnya diurutkan prioritas, lalu sisa node
+    const candidateNodes: any[] = [];
+    if (player?.node?.connected && this.isNodeHealthy(player.node)) {
+      candidateNodes.push(player.node);
+    }
+
+    const otherHealthy = allConnected
+      .filter((n: any) => !candidateNodes.some(c => c.id === n.id) && this.isNodeHealthy(n))
+      .sort((a: any, b: any) => this.getNodePriority(a) - this.getNodePriority(b));
+    candidateNodes.push(...otherHealthy);
+
+    const remaining = allConnected
+      .filter((n: any) => !candidateNodes.some(c => c.id === n.id))
+      .sort((a: any, b: any) => this.getNodePriority(a) - this.getNodePriority(b));
+    candidateNodes.push(...remaining);
+
+    let lastError: any = null;
+    let fallbackNote: string | null = null;
+    const searchSources = isDirectUrl ? [undefined] : ["ytmsearch", "ytsearch", "spsearch", "scsearch"];
+
+    for (const node of candidateNodes) {
+      let nodeHadTimeoutOrNetworkError = false;
+
+      for (const source of searchSources) {
+        try {
+          const res: any = await node.search(
+            { query: searchQuery, source: isDirectUrl ? undefined : source },
+            user
+          );
+
+          if (res && res.loadType !== "error" && res.tracks?.length) {
+            // Berhasil! Jika node berbeda dengan node aktif player saat ini, migrasikan player
+            if (player && player.node?.id !== node.id) {
+              await this.migratePlayerToNode(player, node);
+            }
+
+            if (!isDirectUrl && source && source !== "ytmsearch") {
+              const srcLabel = source === "spsearch" ? "Spotify" : source === "scsearch" ? "SoundCloud" : "YouTube";
+              fallbackNote = `Diputar via sumber cadangan: ${srcLabel}`;
+            }
+
+            return { result: res, fallbackNote: fallbackNote || undefined };
+          }
+
+          if (res?.loadType === "error") {
+            const msg = res.exception?.message || "";
+            if (/timeout|aborted|login|all clients failed|sign in/i.test(msg)) {
+              this.markNodeDegraded(node.id, 45_000);
+            }
+            lastError = new Error(msg);
+          }
+        } catch (err: any) {
+          const errMsg = err?.message || String(err);
+          if (/timeout|aborted|fetch failed|econnreset|econnrefused/i.test(errMsg)) {
+            this.markNodeDegraded(node.id, 60_000);
+            nodeHadTimeoutOrNetworkError = true;
+          }
+          lastError = err;
+        }
+
+        // Jika node ini mengalami network error atau timeout, tidak perlu membuang waktu mencoba source lain di node yang sama
+        if (nodeHadTimeoutOrNetworkError) {
+          break;
+        }
+      }
+    }
+
+    // Jika direct url YouTube gagal dimuat langsung, coba ambil judul via oEmbed dan cari dengan keyword
+    if (isDirectUrl && /(youtube\.com|youtu\.be)/i.test(searchQuery)) {
+      log.warn({ url: searchQuery }, "Link YouTube gagal dimuat langsung. Mencoba ambil judul via oEmbed...");
+      const ytTitle = await getYoutubeTitleFromUrl(searchQuery);
+      if (ytTitle) {
+        log.info({ url: searchQuery, ytTitle }, "Judul ditemukan via oEmbed, memulai pencarian judul...");
+        const res = await this.searchWithClusterFailover(player, ytTitle, false, user).catch(() => null);
+        if (res && res.result?.tracks?.length) {
+          return {
+            result: res.result,
+            fallbackNote: `Diputar dari judul: "${ytTitle}"`,
+          };
+        }
+      }
+    }
+
+    if (lastError) {
+      const msg = lastError.message || String(lastError);
+      if (/timeout|aborted/i.test(msg)) {
+        throw new Error(
+          "Pencarian lagu mengalami timeout karena server audio sedang padat.\n" +
+          "💡 **Solusi:** Coba jalankan kembali `?play <lagu>`, gunakan `?play sc:<lagu>` (SoundCloud), atau ganti host dengan `?changenode`."
+        );
+      }
+      if (/login|all clients failed|sign in/i.test(msg)) {
+        throw new Error(
+          "Server YouTube membatasi pemutaran langsung (This video requires login).\n" +
+          "💡 **Solusi:** Coba ketik `?play sc:<nama lagu>` untuk memutar lagu via SoundCloud."
+        );
+      }
+      throw lastError;
+    }
+
+    throw new Error("Lagu tidak ditemukan. Coba gunakan judul atau link lain.");
+  }
+
   async play(ctx: Ctx, query: string) {
     if (!query?.trim()) {
       return ctx.reply({ content: "❌ Masukkan link atau kata kunci lagu. Contoh: `?play Bohemian Rhapsody` atau `/play query: <link>`." });
@@ -471,64 +687,12 @@ export class MusicService {
       const searchQuery = normalizeQuery(query);
       const isDirectUrl = isUrl(searchQuery);
 
-      let result: any = null;
-      try {
-        result = await player.search(
-          { query: searchQuery, source: isDirectUrl ? undefined : "ytmsearch" },
-          ctx.user
-        );
-      } catch (err: any) {
-        result = { loadType: "error", exception: { message: err?.message || String(err) } };
-      }
-
-      const isYoutubeBlocked = result?.loadType === "error" && (
-        /login|all clients failed|sign in/i.test(result.exception?.message || "")
+      const { result, fallbackNote } = await this.searchWithClusterFailover(
+        player,
+        searchQuery,
+        isDirectUrl,
+        ctx.user
       );
-
-      let fallbackNote: string | null = null;
-
-      // Jika link langsung YouTube diblokir oleh IP server, ambil judul via oEmbed dan cari di YouTube/Spotify/SoundCloud
-      if (isDirectUrl && isYoutubeBlocked && /(youtube\.com|youtu\.be)/i.test(searchQuery)) {
-        log.warn({ url: searchQuery }, "Link YouTube diblokir IP. Mencari judul via oEmbed untuk pencarian ulang...");
-        const ytTitle = await getYoutubeTitleFromUrl(searchQuery);
-        if (ytTitle) {
-          for (const src of ["ytsearch", "spsearch", "scsearch"]) {
-            try {
-              const res: any = await player.search({ query: ytTitle, source: src }, ctx.user).catch(() => null);
-              if (res && res.loadType !== "error" && res.tracks?.length) {
-                result = res;
-                fallbackNote = `Diputar dari hasil pencarian: "${ytTitle}" (${src})`;
-                break;
-              }
-            } catch {}
-          }
-        }
-      }
-
-      // Jika pencarian kata kunci diblokir atau kosong, coba sumber lain (spsearch, scsearch)
-      if ((!result || result.loadType === "empty" || isYoutubeBlocked) && !isDirectUrl) {
-        log.warn({ query: searchQuery }, "YouTube terblokir / requires login. Mencoba fallback ke Spotify / SoundCloud...");
-        for (const src of ["spsearch", "scsearch", "ytsearch"]) {
-          try {
-            const altRes: any = await player.search({ query: searchQuery, source: src }, ctx.user).catch(() => null);
-            if (altRes && altRes.loadType !== "error" && altRes.tracks?.length) {
-              result = altRes;
-              break;
-            }
-          } catch {}
-        }
-      }
-
-      if (result?.loadType === "error") {
-        const errMsg = result.exception?.message || "Gagal memuat lagu dari sumber audio.";
-        if (/login|all clients failed|sign in/i.test(errMsg)) {
-          throw new Error(
-            `Server Lavalink terkena blokir IP YouTube (This video requires login).\n` +
-            `💡 **Solusi:** Aktifkan YouTube OAuth di Lavalink, atau coba ketik: \`?play sc:${searchQuery}\` untuk memutar lewat SoundCloud.`
-          );
-        }
-        throw new Error(errMsg);
-      }
 
       if (!result?.tracks?.length || result.loadType === "empty") {
         throw new Error("Lagu tidak ditemukan. Coba gunakan judul atau link lain.");
@@ -546,7 +710,7 @@ export class MusicService {
         if (player.paused) await player.resume().catch(() => {});
         player.lastPosition = 0;
         player.lastPositionChange = Date.now();
-        await player.play();
+        await this.safePlay(player);
       }
 
       if (isPlaylist) {
@@ -580,7 +744,15 @@ export class MusicService {
         ],
       });
     } catch (e: any) {
-      return ctx.reply({ content: `❌ ${e.message || "Gagal memutar track."}` });
+      const msg = e?.message || "Gagal memutar track.";
+      if (/timeout|aborted/i.test(msg)) {
+        return ctx.reply({
+          content:
+            "❌ **Koneksi Audio Timeout**: Server audio sedang padat atau lambat merespons.\n" +
+            "💡 **Solusi:** Coba jalankan kembali `?play <lagu>` atau gunakan `?changenode` untuk beralih ke node lain.",
+        });
+      }
+      return ctx.reply({ content: `❌ ${msg}` });
     }
   }
 
@@ -981,8 +1153,11 @@ export class MusicService {
 
     allNodes.forEach((node, idx) => {
       const isCurrent = currentPlayerNodeId === node.id || currentPlayerNodeId === node.options?.id;
-      const statusIcon = node.connected ? "🟢" : "🔴";
-      const statusText = node.connected ? "Connected" : "Disconnected / Reconnecting";
+      const isHealthy = this.isNodeHealthy(node);
+      const statusIcon = !node.connected ? "🔴" : (!isHealthy ? "🟡" : "🟢");
+      const statusText = !node.connected
+        ? "Disconnected / Reconnecting"
+        : (!isHealthy ? "Connected (Slow / Cooldown)" : "Connected");
       const rawPing = (node as any).heartBeatPing ?? (node as any).ping?.lavalink;
       const ping = rawPing ? `${rawPing}ms` : (node.connected ? "Active" : "Offline");
       const players = node.stats?.players ?? 0;
@@ -1016,7 +1191,7 @@ export class MusicService {
     const raw = targetInput?.trim();
     if (!raw) {
       return ctx.reply({
-        content: "❌ Masukkan nama atau nomor host yang ingin dituju. Contoh: `?changenode 2` atau `?changenode Lavalink-Backup-Millo`. Ketik `?nodes` untuk melihat daftar host."
+        content: "❌ Masukkan nama atau nomor host yang ingin dituju. Contoh: `?changenode 2` atau `?changenode Lavalink-Nazha`. Ketik `?nodes` untuk melihat daftar host."
       });
     }
 
@@ -1056,6 +1231,7 @@ export class MusicService {
       });
     }
 
+    this.nodeCooldowns.delete(targetNode.id);
     const prevNodeId = p.node?.id || "Unknown";
     await p.changeNode(targetNode, false);
 
@@ -1100,17 +1276,14 @@ export class MusicService {
       const query = cleanAuthor ? `${cleanAuthor} ${cleanTitle}` : cleanTitle;
       if (!query) return false;
 
-      let result: any = await player.search(
-        { query, source: "ytmsearch" },
+      const searchRes = await this.searchWithClusterFailover(
+        player,
+        query,
+        false,
         this.client.user
       ).catch(() => null);
 
-      if (!result?.tracks?.length || result?.loadType === "error") {
-        result = await player.search(
-          { query, source: "scsearch" },
-          this.client.user
-        ).catch(() => null);
-      }
+      const result: any = searchRes?.result;
 
       const seedId = seed?.info?.identifier;
       const candidates = (result?.tracks || []).filter((t: any) => {
@@ -1124,7 +1297,7 @@ export class MusicService {
       await player.queue.add(next);
       player.lastPosition = 0;
       player.lastPositionChange = Date.now();
-      await player.play();
+      await this.safePlay(player);
 
       const ch: any = this.client.channels.cache.get(player.textChannelId);
       await ch?.send?.(`♾️ **Smart Autoplay:** Memutar rekomendasi lagu berikutnya: **[${truncate(trackTitle(next), 80)}](${trackUri(next)})**`).catch?.(() => {});

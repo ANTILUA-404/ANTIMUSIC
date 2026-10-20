@@ -56,6 +56,17 @@ const makeInteractionCtx = (i: any): Ctx => ({
   edit: (payload: any) => i.editReply(typeof payload === "string" ? { content: payload } : payload),
 });
 
+function formatCommandError(e: any): string {
+  const msg = e?.message || String(e || "Error");
+  if (/timeout|aborted/i.test(msg)) {
+    return (
+      "❌ **Koneksi Audio Timeout**: Server audio sedang padat atau lambat merespons.\n" +
+      "💡 **Solusi:** Coba jalankan kembali perintah Anda atau ganti server audio dengan `?changenode`."
+    );
+  }
+  return `❌ ${msg}`;
+}
+
 client.on("interactionCreate", async i => {
   try {
     if (i.isButton()) {
@@ -112,9 +123,10 @@ client.on("interactionCreate", async i => {
   } catch (e: any) {
     log.error({ e }, "Interaction error");
     if (i.isRepliable()) {
+      const errorMsg = formatCommandError(e);
       await (i.replied || i.deferred
-        ? i.editReply({ content: `❌ ${e.message || "Error"}` })
-        : i.reply({ content: `❌ ${e.message || "Error"}`, flags: MessageFlags.Ephemeral })
+        ? i.editReply({ content: errorMsg })
+        : i.reply({ content: errorMsg, flags: MessageFlags.Ephemeral })
       ).catch(() => {});
     }
   }
@@ -183,7 +195,7 @@ client.on("messageCreate", async (m: Message) => {
     if (["help", "h"].includes(cmd)) return void await music.help(ctx);
   } catch (e: any) {
     log.error({ e, cmd }, "Prefix command error");
-    await m.reply(`❌ ${e.message || "Error"}`).catch(() => {});
+    await m.reply(formatCommandError(e)).catch(() => {});
   }
 });
 

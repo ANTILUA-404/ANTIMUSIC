@@ -31,29 +31,29 @@ const primaryNode: LavalinkNodeConfig = {
   secure: bool(process.env.LAVALINK_SECURE, isHttps),
   retryAmount: 1000,
   retryDelay: 5000,
-  requestSignalTimeoutMS: 15000,
+  requestSignalTimeoutMS: 7500,
 };
 
 const builtInFallbacks: LavalinkNodeConfig[] = [
   {
-    id: "Lavalink-Backup-Millo",
-    host: "lava-v4.millohost.my.id",
+    id: "Lavalink-Nazha",
+    host: "lavalink.nazha.online",
     port: 443,
-    authorization: "https://discord.gg/mjS5J2K3ep",
+    authorization: "nazhafreelava",
     secure: true,
     retryAmount: 1000,
     retryDelay: 5000,
-    requestSignalTimeoutMS: 15000,
+    requestSignalTimeoutMS: 7500,
   },
   {
-    id: "Lavalink-Backup-Trinium",
-    host: "lavalink-v4.triniumhost.com",
+    id: "Lavalink-Jirayu",
+    host: "lavalink.jirayu.net",
     port: 443,
-    authorization: "free",
+    authorization: "youshallnotpass",
     secure: true,
     retryAmount: 1000,
     retryDelay: 5000,
-    requestSignalTimeoutMS: 15000,
+    requestSignalTimeoutMS: 7500,
   },
   {
     id: "Lavalink-Backup-Serenetia",
@@ -63,7 +63,7 @@ const builtInFallbacks: LavalinkNodeConfig[] = [
     secure: true,
     retryAmount: 1000,
     retryDelay: 5000,
-    requestSignalTimeoutMS: 15000,
+    requestSignalTimeoutMS: 7500,
   },
 ];
 
@@ -80,7 +80,7 @@ function parseCustomNodes(raw?: string): LavalinkNodeConfig[] {
         secure: bool(item.secure, true),
         retryAmount: 1000,
         retryDelay: 5000,
-        requestSignalTimeoutMS: 15000,
+        requestSignalTimeoutMS: 7500,
       }));
     }
   } catch {}
